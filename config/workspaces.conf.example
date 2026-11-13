@@ -1,0 +1,4 @@
+# Synthetic example only — copy entries into your private workspace registry.
+# One entry per line: alias=/absolute/path or alias=~/path
+demo-service=~/workspaces/demo-service
+sample-api=~/workspaces/sample-api

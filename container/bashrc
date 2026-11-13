@@ -1,0 +1,23 @@
+# Koja interactive shell configuration
+
+KOJA_WORKSPACE="${KOJA_WORKSPACE:-unknown}"
+
+printf '\n'
+printf '\033[1;32m'
+printf '  ┌──────────────────────────────────────────────┐\n'
+printf '  │           KOJA — PROTECTED ENVIRONMENT       │\n'
+printf '  └──────────────────────────────────────────────┘\n'
+printf '\033[0m'
+
+printf '  Workspace : %s\n' "$KOJA_WORKSPACE"
+printf '  Network   : PUBLIC (FILTERED PROXY)\n'
+printf '  Direct IP : BLOCKED\n'
+printf '  Root FS   : READ-ONLY\n'
+printf '  Writable  : /workspace\n'
+printf '\n'
+
+koja_prompt() {
+  PS1='\[\033[1;32m\]koja\[\033[0m\]:\[\033[1;36m\]'"$KOJA_WORKSPACE"'\[\033[0m\] \[\033[1;34m\]\w\[\033[0m\] \$ '
+}
+
+PROMPT_COMMAND=koja_prompt

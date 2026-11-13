@@ -1,0 +1,8 @@
+# Local/private configuration
+.workspaces.conf
+config/workspaces.conf
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/

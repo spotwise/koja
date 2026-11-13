@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+proxy_socket=/run/koja-proxy/proxy.sock
+[[ -S "$proxy_socket" ]] || {
+  printf 'koja: egress proxy socket is missing: %s\n' "$proxy_socket" >&2
+  exit 1
+}
+
+# The container has --network none. This loopback listener forwards proxy
+# requests over the read-only mounted Unix socket; it cannot provide a direct
+# route to any IP network.
+socat TCP-LISTEN:3128,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:"$proxy_socket" &
+forwarder_pid=$!
+
+ready=0
+for _ in {1..50}; do
+  kill -0 "$forwarder_pid" 2>/dev/null || {
+    printf 'koja: local proxy forwarder exited unexpectedly\n' >&2
+    exit 1
+  }
+  if (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 0.1
+done
+(( ready == 1 )) || {
+  printf 'koja: local proxy forwarder did not become ready\n' >&2
+  exit 1
+}
+
+mkdir -p -- "${HOME:-/tmp/koja-home}"
+cd /workspace
+
+exec /bin/bash --noprofile --rcfile /etc/koja/bashrc -i

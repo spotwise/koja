@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+KOJA_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+CONFIG_FILE="${KOJA_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/koja/workspaces.conf}"
+IMAGE="${KOJA_IMAGE:-koja:dev}"
+PROXY_IMAGE="${KOJA_PROXY_IMAGE:-koja-proxy:dev}"
+SESSION_PROXY_NAME=""
+SESSION_VOLUME=""
+SESSION_EGRESS_NETWORK=""
+
+usage() {
+  cat <<'EOF'
+Koja — isolated development workspaces
+
+Usage:
+  koja init
+  koja build
+  koja list
+  koja open ALIAS
+  koja status
+  koja close ALIAS
+  koja config
+  koja help
+
+Commands:
+  init       Create the user configuration file.
+  build      Build the local Koja container image.
+  list       List configured workspaces.
+  open       Start an interactive container for a workspace.
+  status     Show running Koja containers.
+  close      Stop the running container for a workspace.
+  config     Show the configuration file location and contents.
+  help       Show this help.
+
+Environment:
+  KOJA_CONFIG       Override the configuration file path.
+  KOJA_IMAGE        Override the agent image tag (default: koja:dev).
+  KOJA_PROXY_IMAGE  Override the proxy image tag (default: koja-proxy:dev).
+EOF
+}
+
+die() {
+  printf 'koja: error: %s\n' "$*" >&2
+  exit 1
+}
+
+cleanup_session() {
+  [[ -n "$SESSION_PROXY_NAME" ]] && docker rm --force "$SESSION_PROXY_NAME" >/dev/null 2>&1 || true
+  [[ -n "$SESSION_VOLUME" ]] && docker volume rm "$SESSION_VOLUME" >/dev/null 2>&1 || true
+  [[ -n "$SESSION_EGRESS_NETWORK" ]] && docker network rm "$SESSION_EGRESS_NETWORK" >/dev/null 2>&1 || true
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker CLI not found."
+  docker info >/dev/null 2>&1 || die "Docker Engine is unavailable. Start Docker Desktop or the Docker service."
+}
+
+require_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "No configuration found. Run 'koja init' first: $CONFIG_FILE"
+}
+
+# Resolve only literal paths. Never source or eval the configuration file.
+resolve_path() {
+  local value="$1"
+  case "$value" in
+    "~") value="$HOME" ;;
+    "~/"*) value="$HOME/${value#\~/}" ;;
+    /*) ;;
+    *) die "Workspace paths must be absolute or start with ~/ (got: $value)" ;;
+  esac
+
+  [[ -d "$value" ]] || die "Workspace directory does not exist: $value"
+  local resolved
+  resolved="$(cd -- "$value" && pwd -P)" || die "Cannot resolve workspace path: $value"
+
+  # Docker's --mount syntax uses commas as separators.
+  [[ "$resolved" != *,* ]] || die "Workspace paths containing commas are not supported yet: $resolved"
+  printf '%s\n' "$resolved"
+}
+
+# Print "alias<TAB>canonical-path" for every valid entry.
+read_workspaces() {
+  require_config
+  local line alias path resolved
+  local line_number=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_number += 1))
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == *=* ]] || die "$CONFIG_FILE:$line_number: expected ALIAS=PATH"
+    alias="${line%%=*}"
+    path="${line#*=}"
+    [[ "$alias" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "$CONFIG_FILE:$line_number: invalid alias '$alias'"
+    [[ -n "$path" ]] || die "$CONFIG_FILE:$line_number: missing path for '$alias'"
+    resolved="$(resolve_path "$path")"
+    printf '%s\t%s\n' "$alias" "$resolved"
+  done < "$CONFIG_FILE"
+}
+
+find_workspace() {
+  local wanted="$1"
+  local matches=0 found=""
+  local entry alias path
+  while IFS=$'\t' read -r alias path; do
+    [[ "$alias" == "$wanted" ]] || continue
+    ((matches += 1))
+    found="$path"
+  done < <(read_workspaces)
+  (( matches == 1 )) || {
+    if (( matches == 0 )); then
+      die "Unknown workspace '$wanted'. Run 'koja list' to see configured workspaces."
+    else
+      die "Workspace alias '$wanted' is defined more than once in $CONFIG_FILE"
+    fi
+  }
+  printf '%s\n' "$found"
+}
+
+cmd_init() {
+  if [[ -e "$CONFIG_FILE" ]]; then
+    printf 'Configuration already exists: %s\n' "$CONFIG_FILE"
+    return
+  fi
+  mkdir -p -- "$(dirname -- "$CONFIG_FILE")"
+  cat > "$CONFIG_FILE" <<'EOF'
+# Koja workspace registry
+# One entry per line: alias=/absolute/path or alias=~/path
+# Aliases: lowercase letters, digits, underscores and hyphens.
+# Example (synthetic): demo-service=~/workspaces/demo-service
+EOF
+  chmod 600 "$CONFIG_FILE"
+  printf 'Created %s\nEdit it to add your workspace aliases.\n' "$CONFIG_FILE"
+}
+
+cmd_build() {
+  require_docker
+  docker build \
+    --build-arg "KOJA_UID=$(id -u)" \
+    --build-arg "KOJA_GID=$(id -g)" \
+    --tag "$IMAGE" \
+    "$KOJA_ROOT/container"
+  docker build \
+    --tag "$PROXY_IMAGE" \
+    "$KOJA_ROOT/network"
+}
+
+cmd_list() {
+  local found=0 alias path
+  while IFS=$'\t' read -r alias path; do
+    printf '%-20s %s\n' "$alias" "$path"
+    found=1
+  done < <(read_workspaces)
+  (( found == 1 )) || printf 'No workspaces configured in %s\n' "$CONFIG_FILE"
+}
+
+cmd_open() {
+  [[ $# -eq 1 ]] || die "Usage: koja open ALIAS"
+  require_docker
+  local alias="$1"
+  [[ "$alias" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "Invalid workspace alias: $alias"
+  local workspace
+  workspace="$(find_workspace "$alias")"
+
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "Image '$IMAGE' not found. Run 'koja build' first."
+  docker image inspect "$PROXY_IMAGE" >/dev/null 2>&1 || die "Proxy image '$PROXY_IMAGE' not found. Run 'koja build' first."
+
+  local name="koja-$alias"
+  local proxy_name="koja-proxy-$alias"
+  local volume="koja-proxy-$alias"
+  local home_volume="koja-home-$alias"
+  local egress_network="koja-egress-$alias"
+  if docker container inspect "$name" >/dev/null 2>&1; then
+    die "A Koja session for '$alias' is already running. Use 'koja status' or 'koja close $alias'."
+  fi
+
+  # Recover resources left behind if a previous terminal was forcibly killed.
+  docker rm --force "$proxy_name" >/dev/null 2>&1 || true
+  docker volume rm "$volume" >/dev/null 2>&1 || true
+  docker network rm "$egress_network" >/dev/null 2>&1 || true
+
+  SESSION_PROXY_NAME="$proxy_name"
+  SESSION_VOLUME="$volume"
+  SESSION_EGRESS_NETWORK="$egress_network"
+  trap cleanup_session EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+
+  printf 'Starting Koja workspace: %s\n' "$alias"
+  printf 'Workspace: %s\n' "$workspace"
+  printf 'Network: public TCP via IP-filtering proxy; direct networking disabled\n'
+
+  # Keep the CLI home across sessions so Claude and Codex OAuth credentials,
+  # settings and histories survive container removal. Each workspace gets its
+  # own volume; it is deliberately not part of session cleanup.
+  docker volume create "$home_volume" >/dev/null
+  docker run --rm \
+    --network none \
+    --user 0 \
+    --entrypoint /bin/sh \
+    --mount "type=volume,source=$home_volume,target=/koja-home" \
+    "$IMAGE" \
+    -c "chown $uid:$gid /koja-home && chmod 700 /koja-home"
+
+  docker volume create "$volume" >/dev/null
+  # Docker volumes are root-owned initially. Give the session user ownership
+  # so the proxy can create a private Unix socket without running as root.
+  docker run --rm \
+    --network none \
+    --user 0 \
+    --entrypoint /bin/sh \
+    --mount "type=volume,source=$volume,target=/run/koja-proxy" \
+    "$PROXY_IMAGE" \
+    -c "chown $uid:$gid /run/koja-proxy && chmod 700 /run/koja-proxy"
+
+  docker network create --driver bridge "$egress_network" >/dev/null
+  docker run --detach \
+    --name "$proxy_name" \
+    --network "$egress_network" \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --pids-limit 64 \
+    --tmpfs /tmp:rw,nosuid,nodev,size=16m \
+    --mount "type=volume,source=$volume,target=/run/koja-proxy" \
+    --user "$uid:$gid" \
+    "$PROXY_IMAGE" >/dev/null
+
+  local ready=0
+  for _ in {1..50}; do
+    if docker exec "$proxy_name" test -S /run/koja-proxy/proxy.sock >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    local proxy_running
+    proxy_running="$(docker inspect --format '{{.State.Running}}' "$proxy_name" 2>/dev/null || true)"
+    if [[ "$proxy_running" != true ]]; then
+      docker logs "$proxy_name" >&2 2>/dev/null || true
+      die "Egress proxy exited during startup."
+    fi
+    sleep 0.1
+  done
+  (( ready == 1 )) || die "Egress proxy did not create its Unix socket in time."
+
+  docker run --rm \
+    --name "$name" \
+    --label io.koja.managed=true \
+    --label "io.koja.workspace=$alias" \
+    --interactive --tty \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --pids-limit 256 \
+    --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+    --mount "type=bind,source=$workspace,target=/workspace" \
+    --mount "type=volume,source=$volume,target=/run/koja-proxy,readonly" \
+    --mount "type=volume,source=$home_volume,target=/tmp/koja-home" \
+    --workdir /workspace \
+    --user "$uid:$gid" \
+    --env HOME=/tmp/koja-home \
+    --env "KOJA_WORKSPACE=$alias" \
+    --env HTTP_PROXY=http://127.0.0.1:3128 \
+    --env HTTPS_PROXY=http://127.0.0.1:3128 \
+    --env ALL_PROXY=http://127.0.0.1:3128 \
+    --env http_proxy=http://127.0.0.1:3128 \
+    --env https_proxy=http://127.0.0.1:3128 \
+    --env all_proxy=http://127.0.0.1:3128 \
+    --env NO_PROXY= \
+    --env no_proxy= \
+    "$IMAGE"
+}
+
+cmd_status() {
+  require_docker
+  docker ps \
+    --filter label=io.koja.managed=true \
+    --format 'table {{.Names}}\t{{.Status}}\t{{.Label "io.koja.workspace"}}'
+}
+
+cmd_close() {
+  [[ $# -eq 1 ]] || die "Usage: koja close ALIAS"
+  require_docker
+  local alias="$1"
+  [[ "$alias" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "Invalid workspace alias: $alias"
+  local name="koja-$alias"
+  docker container inspect "$name" >/dev/null 2>&1 || die "No running Koja session named '$alias'."
+  docker stop "$name"
+  # Also clean up if the terminal that launched the session was killed.
+  docker rm --force "koja-proxy-$alias" >/dev/null 2>&1 || true
+  docker volume rm "koja-proxy-$alias" >/dev/null 2>&1 || true
+  docker network rm "koja-egress-$alias" >/dev/null 2>&1 || true
+}
+
+cmd_config() {
+  printf 'Configuration: %s\n' "$CONFIG_FILE"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    printf '\n'
+    cat -- "$CONFIG_FILE"
+  else
+    printf 'Not created yet. Run: koja init\n'
+  fi
+}
+
+command="${1:-help}"
+shift || true
+case "$command" in
+  init)   [[ $# -eq 0 ]] || die "Usage: koja init"; cmd_init ;;
+  build)  [[ $# -eq 0 ]] || die "Usage: koja build"; cmd_build ;;
+  list)   [[ $# -eq 0 ]] || die "Usage: koja list"; cmd_list ;;
+  open)   cmd_open "$@" ;;
+  status) [[ $# -eq 0 ]] || die "Usage: koja status"; cmd_status ;;
+  close)  cmd_close "$@" ;;
+  config) [[ $# -eq 0 ]] || die "Usage: koja config"; cmd_config ;;
+  help|-h|--help) usage ;;
+  *) die "Unknown command '$command'. Run 'koja help'." ;;
+esac
