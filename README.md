@@ -105,11 +105,9 @@ releases at build time.
 
 ## Persistent CLI state
 
-Each workspace has a separate Docker volume named `koja-home-ALIAS`, mounted
-as the container's home directory. This preserves Claude and Codex credentials,
-settings and histories across sessions while keeping them separate between
-workspaces. The volume is not removed when a session exits or when `koja close`
-is used.
+Each workspace has a separate Docker volume named koja-home-ALIAS, mounted at /koja-home. The agent's HOME environment variable is set to this location. The installed CLI executables remain in the image-owned /home/koja directory, so the persistent volume does not hide them.
+
+This preserves Claude and Codex credentials, settings and histories across sessions while keeping them separate between workspaces. The volume is not removed when a session exits or when koja close is used.
 
 These credentials are sensitive. An agent running in that workspace can read
 and potentially exfiltrate credentials available to it. Do not authenticate

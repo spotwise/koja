@@ -28,8 +28,12 @@ RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/install-codex.sh \
     && rm -f /tmp/install-codex.sh
 USER root
 
+
+RUN install -d -m 0755 /etc/koja
+
+COPY --chmod=0644 bashrc /etc/koja/bashrc
 COPY entrypoint /usr/local/bin/koja-entrypoint
-COPY --chmod=644 bashrc /etc/koja/bashrc
+
 RUN chmod 0755 /usr/local/bin/koja-entrypoint
 
 WORKDIR /workspace

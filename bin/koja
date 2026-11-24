@@ -204,9 +204,9 @@ cmd_open() {
     --network none \
     --user 0 \
     --entrypoint /bin/sh \
-    --mount "type=volume,source=$home_volume,target=/koja-home" \
-    "$IMAGE" \
-    -c "chown $uid:$gid /koja-home && chmod 700 /koja-home"
+      --mount "type=volume,source=$home_volume,target=/koja-home" \
+      "$IMAGE" \
+      -c "chown $uid:$gid /koja-home && chmod 700 /koja-home"
 
   docker volume create "$volume" >/dev/null
   # Docker volumes are root-owned initially. Give the session user ownership
@@ -261,10 +261,10 @@ cmd_open() {
     --tmpfs /tmp:rw,nosuid,nodev,size=256m \
     --mount "type=bind,source=$workspace,target=/workspace" \
     --mount "type=volume,source=$volume,target=/run/koja-proxy,readonly" \
-    --mount "type=volume,source=$home_volume,target=/tmp/koja-home" \
+    --mount "type=volume,source=$home_volume,target=/koja-home" \
     --workdir /workspace \
     --user "$uid:$gid" \
-    --env HOME=/tmp/koja-home \
+    --env HOME=/koja-home \
     --env "KOJA_WORKSPACE=$alias" \
     --env HTTP_PROXY=http://127.0.0.1:3128 \
     --env HTTPS_PROXY=http://127.0.0.1:3128 \
