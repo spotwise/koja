@@ -4,240 +4,464 @@
 
 Koja provides a secure, isolated environment for running AI coding agents against software projects.
 
-It allows agents to work directly with a project's source files while restricting their access to the host system, credentials, and network resources. The environment should be straightforward to use, secure by default, and portable across development machines.
+It allows AI coding agents to access, modify, build, test and inspect software within a controlled environment, while limiting their access to the host system, credentials, network and other resources.
+
+Koja is designed to support multiple agent instances working independently or collaboratively on the same workspace.
 
 Koja initially supports Claude Code and OpenAI Codex.
 
 ## Operating Principles
 
-- **Isolation:** Agents run inside containers rather than directly on the host.
-- **Least privilege:** Agents receive only the permissions and resources they need.
-- **Controlled networking:** All agent network access is mediated by a separate egress proxy.
-- **Shared workspace:** Agents work directly in the selected project directory, which is also accessible from the host.
-- **Independent state:** Each Koja instance has its own agent home directory, authentication state, and configuration.
-- **Portability:** Prefer conventional, well-supported technologies and avoid unnecessary dependencies.
-- **Simplicity:** Keep the implementation and user interface as straightforward as possible without compromising security.
+Koja follows these principles:
+
+- **Isolation:** Agents execute inside isolated containers with restricted access to the host system and other resources.
+- **Controlled networking:** Agents have no direct network access. Outbound connections are mediated by a dedicated proxy.
+- **Shared workspaces:** Agents and the host can access the same workspace without requiring source code to be copied between environments.
+- **Independent agent state:** Each agent instance has its own persistent home directory, authentication state and agent-specific configuration.
+- **Host-controlled Git:** Agents can inspect Git history and changes but cannot modify Git metadata. The host user retains control over staging and committing.
+- **Least privilege:** Containers are configured with the minimum permissions and resources necessary.
+- **Fail closed:** Koja must not start an agent when required security controls cannot be established.
+- **Simplicity:** Koja should favour straightforward, portable solutions over unnecessary complexity, dependencies or abstractions.
 
 ## Architecture
 
-Each Koja instance consists of an agent container and the supporting infrastructure required to run it.
+Koja uses containers to isolate agent execution from the host.
 
-The agent container:
+Each agent instance runs in its own container. Agent containers share access to their configured workspace but have independent persistent state.
 
-- Runs as an unprivileged user.
-- Has Linux capabilities dropped and `no-new-privileges` enabled.
-- Uses a read-only root filesystem.
-- Has no direct network access.
-- Has access to the selected project through a shared workspace mount.
-- Has separate persistent storage for its home directory and authentication state.
+The architecture consists of:
 
-The egress proxy runs separately from the agent container. Communication between the agent and the proxy is mediated through a Unix socket.
+- **Host:** Runs Koja, manages configuration, workspaces, container lifecycle and Git operations.
+- **Agent container:** Runs the AI coding agent and development tools.
+- **Proxy container:** Mediates outbound network connections on behalf of agents.
+- **Workspace:** A host directory containing a Git repository, mounted into the agent container.
+- **Agent state:** Persistent storage containing agent-specific configuration, authentication and other state.
 
-The agent container must not be able to bypass the proxy to obtain network access.
+Agent containers and proxy containers are separate. The agent container must not have direct network access.
 
-Multiple Koja instances may operate on the same project directory. Each instance retains separate agent state and credentials. Concurrent modifications to source files and Git operations must be treated as potential coordination issues.
+The agent container communicates with the proxy through a Unix-domain socket. The proxy container provides the network access permitted by the effective configuration.
+
+Koja must not depend on a privileged container, host networking, or unrestricted host access to provide its functionality.
+
+### Container engines
+
+Koja supports both Podman and Docker.
+
+Koja automatically selects a container engine according to the following preference:
+
+1. Podman, if available.
+2. Docker, if Podman is unavailable and Docker is available.
+
+If neither engine is available, Koja must report an error and exit.
+
+The container engine may be explicitly selected through configuration. When an engine is explicitly selected, Koja must use that engine rather than silently switching to another engine.
+
+Koja must verify that the selected engine is usable before starting an agent session.
+
+Koja must use the selected engine consistently for managing agent containers, proxy containers, images, persistent state and associated resources.
+
+Koja must support the required security controls and functionality on both engines. Differences between Podman and Docker must not result in weakened security requirements.
+
+The container engine abstraction should remain limited to the functionality Koja requires.
+
+### Container security
+
+Agent containers must:
+
+- Run as an unprivileged user.
+- Drop unnecessary Linux capabilities.
+- Enable `no-new-privileges`.
+- Use a read-only container root filesystem.
+- Have no direct network access.
+- Access the workspace through an explicitly configured mount.
+- Access Git metadata read-only.
+- Access persistent agent state through an explicitly configured volume or mount.
+- Have access to outbound networking only through the Koja proxy.
+
+Koja must configure container security explicitly rather than relying solely on container runtime defaults.
 
 ## Workspace
 
-An agent works directly in the selected project directory.
+A workspace is an existing host directory containing a Git repository.
 
-Changes made by the agent are therefore immediately visible to the host and to other Koja instances using the same directory.
+Koja does not create, initialise or manage workspace directories. The user is responsible for creating and maintaining them.
 
-The shared workspace must be treated as untrusted input when files are subsequently executed or used outside the container. Container isolation does not make workspace contents safe to execute on the host.
+The workspace is mounted into the agent container, allowing the agent to read and modify project files. The same workspace remains accessible from the host and may be shared between multiple agent instances.
 
-Koja must keep agent-specific state and credentials outside the shared workspace.
+Workspace access may be configured as read-write or read-only.
+
+Read-only workspace access prevents the agent from modifying workspace files through the workspace mount. It does not guarantee a consistent snapshot if another process modifies the workspace concurrently.
+
+Koja does not provide concurrency control between agents sharing a workspace. Users are responsible for coordinating simultaneous modifications.
+
+### Git
+
+Git is mandatory for all workspaces.
+
+A configured workspace must be an existing Git working tree. Koja must refuse to open a workspace that is not a Git repository.
+
+Koja does not initialise, configure or manage Git repositories.
+
+The initial implementation supports conventional Git repositories with a repository root and Git metadata located in that repository's `.git` directory. Git worktrees and submodules are not required to be supported initially.
+
+The workspace is mounted read-write or read-only according to its configuration. Git metadata is mounted read-only inside the agent container.
+
+Agents may inspect Git history, status, diffs and other repository information. They must not be able to modify Git metadata through the mounted repository.
+
+The host user retains control over staging, committing, branch management and other Git operations that modify repository metadata.
+
+Git is the primary mechanism for reviewing changes made by agents.
+
+Users must review agent changes before accepting them. This includes tracked changes, untracked files, ignored files, changes to `.gitignore`, scripts, build configuration, dependencies and other content that may affect the host or subsequent execution.
+
+Git does not provide complete filesystem integrity monitoring. Koja does not guarantee that all changes made within a workspace will be represented by ordinary Git diffs.
 
 ## Networking
 
-### General requirements
+Agent containers have no direct network access.
 
-Agents must not have direct network access.
+All outbound network access is mediated by a dedicated proxy container. The proxy enforces the effective network policy independently of the agent software.
 
-All permitted network access goes through an HTTP proxy. This supports HTTP and HTTPS traffic from applications that understand and use an HTTP proxy.
+The agent container communicates with the proxy through a Unix-domain socket. Koja must prevent agents from bypassing the proxy to obtain direct network access.
 
-Koja does not provide general-purpose IP networking to agents. In particular:
+The proxy provides HTTP proxy functionality and HTTP CONNECT tunnelling. CONNECT tunnelling transports TCP data and is not restricted to HTTPS payloads.
 
-- No direct DNS access.
-- No direct TCP or UDP connections.
-- No unrestricted raw networking.
-- No direct access to the host or local networks.
-- No UDP-based QUIC access.
+Koja does not provide direct UDP access, direct DNS access from agent containers, unrestricted raw networking or direct IP networking.
 
-Applications that do not support HTTP proxy configuration cannot use the network unless they are adapted to do so.
+DNS resolution is performed by the proxy.
 
 ### Network modes
 
-Koja supports three mutually exclusive network modes.
+Koja supports three network modes.
 
-**`none`**
+#### none
 
-No proxy access is available to the agent, including access to the services normally required by the selected agent.
+No proxy access is permitted.
 
-**`custom`**
+Agent containers cannot access external network services, including AI agent backend services.
 
-The default mode.
+#### custom
 
-The selected agent's required backend services are automatically permitted. Additional destinations can be explicitly permitted through configuration.
+Custom mode is the default.
 
-The effective policy is determined by the selected agent profile and the configured additional destinations.
+Custom mode permits access to the supported AI agent backend services and explicitly configured additional destinations.
 
-**`full`**
+Both Claude Code and OpenAI Codex backend destinations are permitted by default. The user does not need to select a backend-specific network policy when choosing which agent software to run.
 
-Allows general public HTTP and HTTPS access through the proxy.
+Additional destinations may be configured to support development tools, package repositories, APIs and other services required by the workspace.
 
-This mode does not provide direct network access or unrestricted non-HTTP networking. Destination IP validation remains mandatory.
+#### full
 
-### Agent network requirements
+Full mode permits general public outbound TCP access through HTTP proxy requests and HTTP CONNECT tunnelling, subject to proxy policy and destination validation.
 
-Agent-specific network requirements belong in the corresponding Koja agent profile, not in the proxy implementation.
-
-Each profile specifies the destinations required by that agent. Koja selects the appropriate profile automatically when an agent is selected.
-
-Configuration examples should document the available destinations, with unused agent entries commented out where appropriate.
+It does not provide direct IP networking, UDP, or unrestricted raw network access.
 
 ### Proxy enforcement
 
-The proxy is responsible for enforcing network policy independently of the agent.
+The proxy must enforce destination restrictions independently of agent software.
 
-It must:
+The proxy must:
 
-1. Apply the configured hostname and port policy before resolving a destination.
-2. Resolve the destination hostname.
-3. Validate the resulting IP addresses.
-4. Reject prohibited destinations, including private, loopback, link-local, and reserved address ranges.
-5. Connect directly to a validated IP address rather than performing a second hostname resolution during connection establishment.
+- Apply hostname and port policy before resolving destinations.
+- Resolve destinations using proxy-controlled DNS.
+- Validate resolved IP addresses before connecting.
+- Reject prohibited destinations, including private, loopback, link-local and reserved addresses, as applicable.
+- Prevent DNS rebinding and resolution-related bypasses.
+- Connect to validated destination addresses without performing an uncontrolled second hostname resolution.
+- Reject invalid, ambiguous or prohibited destination representations.
+- Fail closed if policy evaluation, DNS resolution, address validation or connection establishment fails.
+- Prevent access to prohibited destinations even when a hostname resolves to multiple addresses.
+- Ensure that agent processes cannot alter the effective network policy.
 
-The proxy must fail closed if policy evaluation, DNS resolution, or destination validation fails.
+Destination validation must account for IPv4 and IPv6, alternate address representations, mixed permitted and prohibited DNS responses, hostname matching, port restrictions and address changes.
 
-Hostname validation must not be bypassed by alternative IP representations, DNS rebinding, or changes in DNS responses.
-
-The proxy must not contain hardcoded destination lists for individual agents. It receives the effective policy from Koja and enforces it.
+Network policy enforcement must not depend on whether an agent uses Claude Code, Codex or another supported application.
 
 ## Configuration
 
-Koja supports global configuration and a local configuration associated with the Koja repository itself.
+Koja uses YAML configuration files.
 
-### Global configuration
+Configuration is manually created and maintained by the user. Koja does not provide configuration initialisation or mutation commands in the initial implementation.
 
-The global configuration is stored at:
+### Configuration files
 
-`~/.config/koja/config.yaml`
+Koja supports two configuration files:
 
-It contains user-specific defaults, configured projects, and permissions.
+- Global configuration: `~/.config/koja/koja.yaml`
+- Repository-local configuration: `config/koja.yaml`, located in the Koja repository.
 
-It is used whenever Koja is run outside its own repository. It can also be used when Koja is run from its repository.
+An example configuration is provided at:
 
-### Local configuration
+`config/koja.yaml.example`
 
-The local configuration belongs to the Koja repository.
+The example configuration may be copied and modified by the user.
 
-It provides overrides to the global configuration when Koja is run from that repository.
+### Configuration discovery
 
-This allows separate copies or forks of the Koja repository to have independent configurations. It also allows Koja to be used directly from its repository without requiring a global configuration.
+Koja always attempts to load the global configuration when it exists.
 
-The local configuration is not automatically loaded when Koja is run from elsewhere, even if the selected project happens to contain a Koja-related configuration file.
+When Koja is run from its own repository context, Koja also loads the repository-local configuration if it exists.
 
-### Configuration precedence and permissions
+Repository-local configuration is associated with the Koja repository, not with the workspace being opened.
 
-Global configuration establishes the user's defaults and permissions.
+The repository-local configuration is resolved relative to the Koja repository. It must not be discovered by searching the target workspace or arbitrary directories.
 
-Local configuration may override global configuration when Koja is run from its own repository.
+When Koja is run through its executable from a directory outside the Koja repository, only the global configuration is loaded.
 
-Project-specific requirements and permission requests must not silently weaken the user's global security settings or override Koja's security invariants.
+The global configuration is optional. Repository-local configuration may be used without a global configuration.
 
-Any request to expand permissions beyond those already granted requires explicit user approval.
+If neither configuration file exists, Koja exits with a warning explaining how to create a configuration by copying `config/koja.yaml.example`.
 
-Koja must make the effective configuration inspectable, including the source of each applicable setting.
+If a configuration file exists but cannot be parsed or validated, Koja exits with an error. It must not silently fall back to another configuration.
 
-Example configurations should be provided and installed by `koja init` and `koja init --global`, as appropriate.
+### Configuration merging
+
+When both configurations are present, repository-local configuration overrides the global configuration.
+
+Configuration merging follows these rules:
+
+- Global configuration establishes the baseline.
+- Repository-local configuration overrides global settings where both configurations define the same setting.
+- Settings not defined in repository-local configuration inherit their global values.
+- Workspace definitions are merged by name. A repository-local definition replaces a global definition with the same name.
+- Repository-local configuration may override network modes and permitted destinations.
+- Repository-local configuration may be used without a global configuration.
+
+The effective configuration must be validated before starting an agent or proxy.
+
+Configuration parsing, merging and validation must be separate operations.
+
+Security requirements must be enforced independently of configuration merging. Overriding a network mode or destination policy must not circumvent container isolation, proxy enforcement, destination validation or other fundamental security controls.
+
+### Workspace configuration
+
+Each configured workspace has a name, directory and associated settings.
+
+Workspace configuration must allow the user to specify:
+
+- Workspace name.
+- Host directory.
+- Workspace access mode.
+- Network mode.
+- Additional permitted network destinations, where applicable.
+
+Workspace directories must refer to existing Git repositories.
+
+Koja must validate workspace paths and repository requirements before starting an agent.
+
+The configuration format must support multiple workspaces and allow them to be referenced by name.
+
+### Container engine configuration
+
+Container engine configuration may specify:
+
+- `auto`: Automatically select an available engine, preferring Podman over Docker.
+- `podman`: Use Podman.
+- `docker`: Use Docker.
+
+Automatic selection is the default.
+
+An explicitly selected engine must be available and usable. Koja must not silently fall back to another engine when an explicitly selected engine cannot be used.
+
+### Network configuration
+
+Network configuration defines:
+
+- Network mode.
+- Permitted additional destinations.
+- Destination hostname and port restrictions, as applicable.
+
+The global configuration establishes the baseline network policy.
+
+Repository-local configuration may override global network settings. The effective network policy is determined by the merged configuration.
+
+Both supported AI agent backend services must be permitted by default in custom mode unless overridden by the effective configuration.
 
 ## Security Requirements
 
-Security is a fundamental property of Koja, not something delegated to the coding agent.
+Koja must enforce the following security requirements:
 
-The implementation must:
+- Agent containers must not have direct network access.
+- Outbound network access must be mediated by the proxy.
+- Agents must not be able to bypass proxy enforcement.
+- Proxy access must be restricted to the effective network policy.
+- Destination IP validation must prevent access to prohibited addresses.
+- Proxy enforcement must fail closed.
+- Agent containers must run with restricted privileges.
+- Agent containers must use a read-only root filesystem.
+- Git metadata must be read-only inside agent containers.
+- Workspaces must be validated as existing Git repositories.
+- Agent state and authentication must be isolated between agent instances.
+- Agents must not access the persistent state or credentials of other agent instances.
+- Agents must not be able to change their own network permissions.
+- Koja must not start an agent if required security controls cannot be established.
+- Container and proxy lifecycle management must not leave unintended resources or network access behind when an instance terminates.
 
-- Fail closed when security policy cannot be established or enforced.
-- Prevent agents from bypassing the controlled network path.
-- Reject prohibited IP address ranges.
-- Validate destinations against the applicable hostname and port policy before connecting.
-- Enforce network restrictions independently of the agent software.
-- Keep agent credentials and persistent state separate from the shared workspace.
-- Run agents without unnecessary privileges.
-- Treat workspace contents as untrusted when accessed outside the container.
-- Preserve security invariants regardless of configuration overrides.
+Koja must be designed to minimise the risk of an agent compromising the host or accessing resources outside its permitted environment.
 
-The security model must not rely on an agent voluntarily following instructions or respecting its own configuration.
+The workspace and its contents must be treated as untrusted when accessed outside the isolated container.
 
 ## Agents
 
-The initial supported agents are:
+Koja initially supports:
 
-- Claude Code
-- OpenAI Codex
+- Claude Code.
+- OpenAI Codex.
 
-Koja manages the configuration and network requirements for each supported agent.
+Both agents are installed in the initial agent container image.
 
-Agent-specific settings, including required network destinations, belong in agent profiles. The proxy remains independent of the agent implementation.
+The user may run either agent within a configured workspace. Network policy must not depend on which agent is selected.
 
-The architecture should allow additional agents to be supported without requiring changes to the underlying isolation or proxy enforcement mechanisms.
+Each agent instance has its own persistent agent state, including:
+
+- Agent-specific configuration.
+- Authentication state.
+- Agent home directory.
+- Other persistent state required by the agent.
+
+Agent state must not be shared between instances unless explicitly supported and configured.
+
+Credentials must be accessible only to the agent instance to which they belong.
+
+An agent instance may be opened against a workspace shared with another agent instance. Sharing a workspace does not imply sharing agent state, authentication or configuration.
 
 ## Command-line Interface
 
-Koja provides a command-line interface for managing the development environments.
+Koja provides the following commands.
 
-The interface should support:
+### `koja build`
 
-- `koja init` — initialise a project for use with Koja.
-- `koja init --global` — initialise global Koja configuration.
-- `koja build` — build the required container image.
-- `koja list` — list configured projects.
-- `koja open <project>` — open an agent workspace for the specified project.
-- `koja open` — open an agent workspace for the current directory, subject to the requirements in the Running section.
-- `koja status` — inspect the status of Koja instances.
-- `koja close` — close a Koja instance.
-- `koja config` — inspect the effective configuration.
+Builds the Koja container image using the selected container engine.
 
-Commands should have predictable behaviour and provide useful error messages when their prerequisites are not met.
+### `koja list`
 
-## Running
+Lists configured workspaces.
 
-Koja can be run in a few different ways.
+### `koja open <project>`
 
-1. Change directory to the repository containing Koja, then type `koja open <project>`.
-   - This uses the global configuration, if present, with the overrides specified in the local configuration.
-   - A global configuration is not required in this mode.
+Opens a configured workspace by name and starts an interactive agent session.
 
-2. Ensure that `bin/koja` is in the `PATH`, then type `koja open <project>`.
-   - This uses only the global configuration.
+### `koja open`
 
-3. Ensure that `bin/koja` is in the `PATH`, change to a project directory and type `koja open`.
-   - This also uses only the global configuration.
-   - The current directory must be specified in the global configuration. Otherwise, Koja exits with an error message.
+Opens the current directory as a workspace, provided it is configured and satisfies workspace requirements.
 
-This provides two main ways of using Koja:
+### `koja status`
 
-1. **Repository-based usage:** Run Koja from its own repository to open a workspace in another directory. In this case, there will most likely be no global configuration. This also allows entirely separate configurations by creating multiple copies or forks of the Koja repository.
+Lists and inspects running Koja instances, if any.
 
-2. **PATH-based usage:** Run Koja from anywhere, provided its executable is in the `PATH`. This allows users to quickly start working by typing `koja list`, followed by `koja open <project>`.
+### `koja config`
 
-The availability of the local configuration is determined by running Koja from its own repository. It must not be loaded merely because the executable was found there or because the target project contains a configuration file.
+Displays the effective configuration after configuration discovery, merging and validation.
+
+The output must make it possible to inspect the effective workspace, container engine and network configuration.
+
+The CLI must report configuration and operational errors clearly.
+
+Koja must not silently ignore invalid configuration, security failures or unavailable resources.
+
+## Development Environment
+
+The initial Koja image should provide a general-purpose development environment suitable for AI-assisted software development.
+
+It must include:
+
+- A shell and essential command-line utilities.
+- Git and basic repository inspection tools.
+- Claude Code and OpenAI Codex.
+- The dependencies required to run the supported agents.
+- Basic tools for downloading, inspecting and working with source code through the Koja proxy.
+
+The base image should remain reasonably small. It must not include complete development toolchains for every supported programming language by default.
+
+Development environments for languages such as Go, Ruby, Python, C and C++ should be installable or configurable as required by individual projects.
+
+Project-specific compilers, SDKs, libraries and build tools should not be included in the base image unless they are needed by Koja itself or are justified as common baseline dependencies.
+
+Development tools installed outside the base image should preferably reside in persistent storage where appropriate, so that they remain available between sessions.
+
+The environment must support accessing HTTP services through the Koja proxy, including a diagnostic service such as `http://ip.spotwise.net`, which may be used to verify proxy connectivity and observe the externally visible IP address of a request.
+
+## Running Koja
+
+Koja supports the following usage patterns.
+
+### Running from the Koja repository
+
+When running Koja from its own repository, repository-local configuration is available in addition to the global configuration.
+
+For example:
+
+`koja open <project>`
+
+This uses the global configuration and repository-local overrides when available.
+
+The global configuration is not mandatory if the repository-local configuration is sufficient.
+
+### Running from PATH
+
+When Koja is installed or made available through PATH and run outside its repository context, Koja uses the global configuration.
+
+For example:
+
+`koja open <project>`
+
+### Opening the current directory
+
+A user may change to a configured workspace and open it directly:
+
+`koja open`
+
+The current directory must be listed in the effective configuration and must satisfy the workspace requirements.
+
+Koja must not automatically register, initialise or modify a workspace merely because the user invokes the command from that directory.
+
+## Session Lifecycle
+
+`koja open` launches an interactive container session attached to the terminal from which Koja is invoked.
+
+The workspace is mounted into the container according to its configuration. The agent container runs in the foreground, providing an interactive shell environment in which the user can run Claude Code, Codex and other development tools.
+
+The user terminates the interactive session by exiting the shell or session.
+
+When the interactive session terminates, Koja must clean up the associated container and temporary resources.
+
+Persistent agent state is retained between sessions.
+
+Koja must not leave unintended containers, proxy resources, sockets or network access behind when an interactive session terminates.
+
+Koja must handle unexpected session termination and failures without leaving unintended resources behind.
 
 ## Design Constraints
 
-- Prefer simple, conventional, portable solutions.
-- Avoid unnecessary dependencies and infrastructure.
-- Keep security enforcement independent of the agent.
-- Keep agent-specific configuration separate from generic proxy enforcement.
-- Do not compromise isolation for convenience.
-- Avoid architecture changes that add complexity without a clear security or functional benefit.
+Koja must favour:
+
+- Straightforward implementation.
+- Portable solutions where practical.
+- Minimal external dependencies.
+- Explicit configuration.
+- Clear separation between host management, agent execution and network enforcement.
+- Security controls that do not depend on agent behaviour.
+- Predictable resource and container lifecycle management.
+
+Koja must avoid:
+
+- Unnecessary abstractions.
+- Configuration mutation commands in the initial implementation.
+- Direct network access from agent containers.
+- Privileged agent containers.
+- Dependence on a particular AI agent's internal behaviour for security enforcement.
+- Unnecessary host services.
+- Unnecessary complexity in workspace or agent management.
+- Features that do not directly support the initial use cases.
 
 ## Requirements and Implementation
 
-This document defines the product requirements and is the authority for implementation decisions.
+This document is the authoritative specification for Koja.
 
-The implementation must conform to these requirements.
+Implementation must satisfy the requirements defined here.
 
-When a requirement is ambiguous or conflicts with another requirement, resolve the ambiguity before implementing the affected behaviour.
+Where implementation details are not specified, the implementation should choose the simplest approach consistent with the architecture, security requirements and design constraints.
 
-Changes to requirements should be reflected in this document so that it remains an accurate description of the intended product.
+Requirements must not be weakened or bypassed merely to simplify implementation.
+
+Changes to the architecture, security requirements, configuration semantics or supported use cases must be reflected in this document.
